@@ -45,26 +45,41 @@ app.use((req, res, next) => {
   next();
 });
 
-const CUSTOMER_BACKEND_URL = process.env.CUSTOMER_BACKEND_URL || "https://apikey-customer-backend.onrender.com";
-const MCP_BACKEND_URL = process.env.MCP_BACKEND_URL || "https://apikey-mcp-backend.onrender.com";
+const CUSTOMER_BACKEND_URL = process.env.CUSTOMER_BACKEND_URL || "https://customer-backend-stqk.onrender.com";
+const MCP_BACKEND_URL = process.env.MCP_BACKEND_URL || "https://prototype-mcp-backend.onrender.com";
 
 const getHostUrl = (req) => `${req.protocol}://${req.get("host")}`;
 
 // resource identifier this app requests tokens against when exchanging an
 // API key. Must match what mcp-backend checks as its expected audience.
-const MCP_APP_RESOURCE_URL = process.env.MCP_APP_RESOURCE_URL || "https://apikey-mcp-app.onrender.com/mcp";
+const MCP_APP_RESOURCE_URL = process.env.MCP_APP_RESOURCE_URL || "https://prototype-mcp.onrender.com/mcp";
 
 // ---------------------------------------------------------------------------
-// SESSION STORE
-// sessionId -> { transport, authToken: string|null, authenticated: boolean }
-// One McpServer/transport pair per active streamable-HTTP session, so that
-// state set by submit_api_key on one request is visible to get_workspace*
-// tool calls on later requests within the same chat session.
+// SESSION STORE (protocol routing only)
+// sessionId -> { transport }
+// One transport per active streamable-HTTP session, purely so MCP protocol
+// messages get routed to the right server/transport pair.
 // ---------------------------------------------------------------------------
 const sessions = new Map();
 
+// ---------------------------------------------------------------------------
+// AUTH STATE (deliberately NOT per-session)
+// In testing, the connecting client re-initializes a fresh MCP session on
+// most turns rather than reusing one Mcp-Session-Id for the whole
+// conversation — so auth state tied to a session id gets thrown away the
+// moment the session churns. Since this prototype already assumes a single
+// mock user (see the single-slot activeApiKey on the customer backend),
+// auth state here is likewise a single global slot rather than per-session.
+// PROD NOTE: a real multi-user version would need a stable identity to key
+// this by (e.g. a cookie set on the widget's iframe, or a longer-lived
+// per-user session token), not the transport session id.
+// ---------------------------------------------------------------------------
+let authState = { token: null, authenticated: false };
+
 // Propagates the current session id into tool handlers, which run inside
-// async callbacks where we don't otherwise have access to `req`.
+// async callbacks where we don't otherwise have access to `req`. Still
+// useful for logging / future per-session needs even though auth no longer
+// depends on it.
 const requestContext = new AsyncLocalStorage();
 
 const AUTH_WIDGET_HTML = `
@@ -134,16 +149,8 @@ const AUTH_WIDGET_HTML = `
 </script>
 `;
 
-function currentSession() {
-  const store = requestContext.getStore();
-  const sessionId = store?.sessionId;
-  if (!sessionId) return null;
-  return sessions.get(sessionId) || null;
-}
-
 async function fetchCustomerData() {
-  const session = currentSession();
-  if (!session?.authenticated || !session.authToken) {
+  if (!authState.authenticated || !authState.token) {
     const err = new Error(
       "Not authenticated yet. Call the 'authenticate' tool, generate an API key on the dashboard, and paste it into the widget."
     );
@@ -152,14 +159,13 @@ async function fetchCustomerData() {
   }
 
   const response = await fetch(`${MCP_BACKEND_URL}/api/v1/projects`, {
-    headers: { Authorization: `Bearer ${session.authToken}` }
+    headers: { Authorization: `Bearer ${authState.token}` }
   });
 
   if (response.status === 401 || response.status === 403) {
-    // Token expired or was rejected downstream — drop local auth state so
-    // the next call prompts re-authentication instead of looping on stale data.
-    session.authenticated = false;
-    session.authToken = null;
+    // Token expired or was rejected downstream — drop auth state so the
+    // next call prompts re-authentication instead of looping on stale data.
+    authState = { token: null, authenticated: false };
     const err = new Error("Your session expired. Please authenticate again.");
     err.code = "NOT_AUTHENTICATED";
     throw err;
@@ -236,37 +242,41 @@ function buildServer() {
       inputSchema: { apiKey: z.string().min(1) }
     },
     async ({ apiKey }) => {
-      const session = currentSession();
-      if (!session) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: "No active session found. Please reconnect and try again." }]
-        };
-      }
-
+      const exchangeUrl = `${CUSTOMER_BACKEND_URL}/api/exchange-api-key`;
       try {
-        const resp = await fetch(`${CUSTOMER_BACKEND_URL}/api/exchange-api-key`, {
+        const resp = await fetch(exchangeUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ apiKey, resource: MCP_APP_RESOURCE_URL })
         });
 
         if (!resp.ok) {
-          const errBody = await resp.json().catch(() => ({}));
+          const rawBody = await resp.text();
+          let errBody = {};
+          try {
+            errBody = JSON.parse(rawBody);
+          } catch {
+            // Non-JSON body (e.g. an HTML 404 page) usually means
+            // exchangeUrl is wrong, not that the key itself was rejected.
+          }
+          console.error(
+            `[MCP APP] Key exchange failed. url=${exchangeUrl} status=${resp.status} body=${rawBody.slice(0, 300)}`
+          );
           return {
             isError: true,
             content: [
               {
                 type: "text",
-                text: errBody.error_description || "That API key was rejected. Generate a new one and try again."
+                text:
+                  errBody.error_description ||
+                  `That API key was rejected (HTTP ${resp.status} from ${exchangeUrl}). Check CUSTOMER_BACKEND_URL and try again.`
               }
             ]
           };
         }
 
         const { access_token } = await resp.json();
-        session.authToken = access_token;
-        session.authenticated = true;
+        authState = { token: access_token, authenticated: true };
 
         return {
           content: [{ type: "text", text: "Authenticated successfully." }]
@@ -425,7 +435,7 @@ app.use("/mcp", express.json(), async (req, res) => {
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => crypto.randomUUID(),
         onsessioninitialized: (sessionId) => {
-          sessions.set(sessionId, { transport, authToken: null, authenticated: false });
+          sessions.set(sessionId, { transport });
           console.log(`[MCP APP] Session initialized: ${sessionId}`);
         }
       });
@@ -438,7 +448,7 @@ app.use("/mcp", express.json(), async (req, res) => {
       };
 
       await server.connect(transport);
-      entry = { transport, authToken: null, authenticated: false };
+      entry = { transport };
     } else {
       return res.status(400).json({
         jsonrpc: "2.0",
@@ -457,4 +467,9 @@ app.use("/mcp", express.json(), async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`MCP App running on port ${port}`));
+app.listen(port, () => {
+  console.log(`MCP App running on port ${port}`);
+  console.log(`[CONFIG] CUSTOMER_BACKEND_URL = ${CUSTOMER_BACKEND_URL}`);
+  console.log(`[CONFIG] MCP_BACKEND_URL      = ${MCP_BACKEND_URL}`);
+  console.log(`[CONFIG] MCP_APP_RESOURCE_URL = ${MCP_APP_RESOURCE_URL}`);
+});
