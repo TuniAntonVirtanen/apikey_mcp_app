@@ -1,8 +1,9 @@
-// MCP-APP
-
+// MCP app
 import express from "express";
 import cors from "cors";
-import { z } from "zod";
+import crypto from "crypto";
+import jwt from "jsonwebtoken";
+import { AsyncLocalStorage } from "async_hooks";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
@@ -12,7 +13,7 @@ app.set("trust proxy", 1);
 app.use(
   cors({
     origin: "*",
-    exposedHeaders: ["Mcp-Session-Id"]
+    exposedHeaders: ["WWW-Authenticate", "Mcp-Session-Id"]
   })
 );
 
@@ -24,162 +25,108 @@ app.use((req, res, next) => {
 const CUSTOMER_BACKEND_URL = process.env.CUSTOMER_BACKEND_URL || "https://customer-backend-stqk.onrender.com";
 const MCP_BACKEND_URL = process.env.MCP_BACKEND_URL || "https://prototype-mcp-backend.onrender.com";
 
-// This service's own public URL. Used as the `resource` value when
-// exchanging an API key for an access token. MUST exactly match the
-// MCP_APP_RESOURCE_URL configured on mcp-backend (`${PUBLIC_URL}/mcp` there
-// must equal `${PUBLIC_URL}/mcp` here) — that's the audience mcp-backend
-// checks incoming tokens against.
-const PUBLIC_URL = process.env.PUBLIC_URL || "https://prototype-mcp.onrender.com";
-const MCP_RESOURCE_URI = `${PUBLIC_URL}/mcp`;
+const getHostUrl = (req) => `${req.protocol}://${req.get("host")}`;
+
+// AsyncLocalStorage propagates request context (Auth Header) into tool handler calls asynchronously
+const requestContext = new AsyncLocalStorage();
 
 // ---------------------------------------------------------------------------
-// SINGLE ACTIVE AUTHENTICATED SESSION (PROTOTYPE SIMULATION)
-// This is a single-user prototype (mirroring the "one active API key" model
-// on customer-backend), so one in-memory slot is enough to represent
-// "is this mcp-app instance currently authenticated, and with what token".
-// Any client that successfully calls the `authenticate` tool authenticates
-// the whole instance for every connected caller — there's no per-connection
-// isolation. Fine here; a real multi-user deployment would key this by MCP
-// session id (or whatever identifies a distinct connected client) instead.
-// PROD NOTE: Replace with per-session storage (DB or cache) for multi-user use.
+// Token verification (JWKS-backed RS256). Previously this middleware only
+// checked that an Authorization: Bearer header was present, and fully
+// deferred trust to mcp-backend. As the service that actually publishes
+// /.well-known/oauth-protected-resource, mcp-app is the OAuth resource
+// server for this MCP endpoint, so it now verifies the signature, expiry,
+// and audience itself instead of passing an unverified token onward.
 // ---------------------------------------------------------------------------
-let currentSession = null;
-// shape when set: { accessToken: string, expiresAt: number }
+let cachedPemPublicKey = null;
 
-function isSessionValid() {
-  return !!currentSession && Date.now() < currentSession.expiresAt;
+async function getPublicKeyFromJWKS() {
+  if (cachedPemPublicKey) return cachedPemPublicKey;
+
+  const resKey = await fetch(`${CUSTOMER_BACKEND_URL}/.well-known/jwks.json`);
+  if (!resKey.ok) throw new Error(`Failed to fetch JWKS: ${resKey.status}`);
+
+  const jwks = await resKey.json();
+  const jwk = jwks.keys && jwks.keys[0];
+  if (!jwk) throw new Error("No public key found in JWKS");
+
+  const keyObject = crypto.createPublicKey({ key: jwk, format: "jwk" });
+  cachedPemPublicKey = keyObject.export({ type: "spki", format: "pem" });
+  return cachedPemPublicKey;
 }
 
-function clearSession(reason) {
-  if (currentSession) {
-    console.log(`[MCP APP] Clearing session (${reason})`);
-  }
-  currentSession = null;
-}
+const validateAuthHeader = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  const host = getHostUrl(req);
 
-// Exchanges a user-supplied API key for a resource-bound access token by
-// calling customer-backend directly over HTTPS. Because mcp-app made this
-// request itself and got the token back over a trusted transport, it does
-// NOT re-verify the token's signature locally — signature + audience
-// verification still happens (and is what actually matters) at mcp-backend
-// on every subsequent data request, and again (signature-only) at
-// customer-backend. mcp-app never re-signs or re-issues anything; it only
-// ever caches and forwards exactly what customer-backend returned.
-async function exchangeApiKeyForToken(apiKey) {
-  const response = await fetch(`${CUSTOMER_BACKEND_URL}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "api_key",
-      api_key: apiKey,
-      resource: MCP_RESOURCE_URI
-    })
-  });
-
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    const reason = data.error_description || data.error || `HTTP ${response.status}`;
-    throw new Error(reason);
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    res.set(
+      "WWW-Authenticate",
+      `Bearer realm="mcp", resource_metadata="${host}/.well-known/oauth-protected-resource"`
+    );
+    return res.status(401).json({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Authentication required." },
+      id: null
+    });
   }
 
-  return data; // { access_token, token_type, expires_in }
-}
+  const token = authHeader.slice("Bearer ".length);
 
-// Calls mcp-backend (which independently verifies signature + audience
-// before doing anything) using the currently cached access token.
-const fetchCustomerData = async (accessToken) => {
+  // This is the same resource identifier advertised in
+  // /.well-known/oauth-protected-resource below, and the value a
+  // well-behaved client passes as `resource` when it requests
+  // authorization. A token not issued for this exact resource is rejected,
+  // even if it is validly signed by the trusted authorization server.
+  const resourceUri = `${host}/mcp`;
+
+  try {
+    const publicKey = await getPublicKeyFromJWKS();
+    const verifiedPayload = jwt.verify(token, publicKey, {
+      algorithms: ["RS256"],
+      audience: resourceUri
+    });
+    req.authTokenPayload = verifiedPayload;
+    next();
+  } catch (err) {
+    console.error("[MCP APP AUTH ERROR]", err.message);
+    // Invalidate cached key if verification fails to allow key rotation recovery
+    cachedPemPublicKey = null;
+    res.set(
+      "WWW-Authenticate",
+      `Bearer realm="mcp", resource_metadata="${host}/.well-known/oauth-protected-resource", error="invalid_token"`
+    );
+    return res.status(401).json({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: `Token verification failed: ${err.message}` },
+      id: null
+    });
+  }
+};
+
+// Helper for tool execution to fetch data using active context token
+const fetchCustomerData = async () => {
+  const store = requestContext.getStore();
+  const authToken = store?.authToken;
+
+  if (!authToken) {
+    throw new Error("Missing authentication context for tool execution.");
+  }
+
   const response = await fetch(`${MCP_BACKEND_URL}/api/v1/projects`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
+    headers: { Authorization: authToken }
   });
 
-  if (!response.ok) {
-    const err = new Error(`MCP Backend status ${response.status}`);
-    err.status = response.status;
-    throw err;
-  }
-
+  if (!response.ok) throw new Error(`MCP Backend status ${response.status}`);
   const result = await response.json();
   return result.data;
 };
 
-const AUTH_REQUIRED_MESSAGE =
-  `Authentication required before this tool can be used. Ask the user to: ` +
-  `1) log in to the customer dashboard at ${CUSTOMER_BACKEND_URL}, ` +
-  `2) use the "API Key" panel there to generate a key (choosing how many minutes it should stay valid), ` +
-  `3) paste that API key back into this chat. ` +
-  `Once you have it, call the "authenticate" tool with that key, then retry this tool.`;
-
 // Application-scoped single MCP server instance
 const server = new McpServer({
   name: "customer-mcp-app",
-  version: "3.0.0"
+  version: "2.0.0"
 });
-
-// -------------------------------------------------------------------------
-// AUTH TOOL
-// -------------------------------------------------------------------------
-server.tool(
-  "authenticate",
-  `Authenticates this MCP connection using an API key the user generated on the customer dashboard (${CUSTOMER_BACKEND_URL}). ` +
-    `Call this as soon as the user supplies an API key, or whenever another tool reports that authentication is required. ` +
-    `Do not call it speculatively without a real key from the user.`,
-  {
-    api_key: z.string().min(1).describe("The API key the user copied from the customer dashboard.")
-  },
-  async ({ api_key }) => {
-    try {
-      const tokenData = await exchangeApiKeyForToken(api_key);
-      currentSession = {
-        accessToken: tokenData.access_token,
-        expiresAt: Date.now() + tokenData.expires_in * 1000
-      };
-      const minutesLeft = Math.max(1, Math.round(tokenData.expires_in / 60));
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Authentication successful. This session is valid for about ${minutesLeft} minute(s). You can now use the other tools.`
-          }
-        ]
-      };
-    } catch (err) {
-      clearSession("failed authentication attempt");
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text",
-            text: `Authentication failed: ${err.message}. Ask the user to generate a fresh API key on the dashboard (${CUSTOMER_BACKEND_URL}) and try again.`
-          }
-        ]
-      };
-    }
-  }
-);
-
-// Shared wrapper for every data tool below: checks the cached session before
-// doing any work, and drops the session if the backend ever rejects it.
-async function withAuth(handler) {
-  if (!isSessionValid()) {
-    clearSession("no valid session at tool-call time");
-    return { content: [{ type: "text", text: AUTH_REQUIRED_MESSAGE }] };
-  }
-
-  try {
-    return await handler(currentSession.accessToken);
-  } catch (err) {
-    console.error("[MCP APP] Error querying MCP Backend:", err.message);
-    if (err.status === 401 || err.status === 403) {
-      // mcp-backend (or customer-backend behind it) no longer considers this
-      // token good — expired right at the boundary, revoked, etc. Drop it so
-      // the next call re-prompts instead of silently retrying with a dead token.
-      clearSession("rejected by mcp-backend");
-      return { content: [{ type: "text", text: AUTH_REQUIRED_MESSAGE }] };
-    }
-    return { isError: true, content: [{ type: "text", text: `Error processing request: ${err.message}` }] };
-  }
-}
 
 // -------------------------------------------------------------------------
 // WORKSPACE 1 TOOLS
@@ -188,10 +135,11 @@ server.tool(
   "get_workspace1",
   "Fetches workspace 1 sprint metrics from the customer account.",
   {},
-  async () =>
-    withAuth(async (accessToken) => {
-      const data = await fetchCustomerData(accessToken);
+  async () => {
+    try {
+      const data = await fetchCustomerData();
       const ws1 = data.workspace1;
+
       return {
         content: [
           {
@@ -200,7 +148,14 @@ server.tool(
           }
         ]
       };
-    })
+    } catch (err) {
+      console.error("[MCP APP] Error querying MCP Backend:", err.message);
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Error processing request: ${err.message}` }]
+      };
+    }
+  }
 );
 
 // -------------------------------------------------------------------------
@@ -210,20 +165,25 @@ server.tool(
   "get_workspace2_raw",
   "Fetches raw key-value pair metrics for Workspace 2.",
   {},
-  async () =>
-    withAuth(async (accessToken) => {
-      const data = await fetchCustomerData(accessToken);
-      return { content: [{ type: "text", text: JSON.stringify({ metrics: data.workspace2 }) }] };
-    })
+  async () => {
+    try {
+      const data = await fetchCustomerData();
+      return {
+        content: [{ type: "text", text: JSON.stringify({ metrics: data.workspace2 }) }]
+      };
+    } catch (err) {
+      return { isError: true, content: [{ type: "text", text: err.message }] };
+    }
+  }
 );
 
 server.tool(
   "get_workspace2_formatted",
   "Fetches Workspace 2 data formatted as a graphical bar chart.",
   {},
-  async () =>
-    withAuth(async (accessToken) => {
-      const data = await fetchCustomerData(accessToken);
+  async () => {
+    try {
+      const data = await fetchCustomerData();
       const labels = Object.keys(data.workspace2).map(k => `"${k}"`).join(", ");
       const values = Object.values(data.workspace2).join(", ");
 
@@ -245,7 +205,10 @@ server.tool(
           }
         ]
       };
-    })
+    } catch (err) {
+      return { isError: true, content: [{ type: "text", text: err.message }] };
+    }
+  }
 );
 
 // -------------------------------------------------------------------------
@@ -255,22 +218,41 @@ server.tool(
   "get_workspace3_raw",
   "Fetches raw edge-pair transitions representing a graph from Workspace 3.",
   {},
-  async () =>
-    withAuth(async (accessToken) => {
-      const data = await fetchCustomerData(accessToken);
-      return { content: [{ type: "text", text: JSON.stringify({ edges: data.workspace3 }) }] };
-    })
+  async () => {
+    try {
+      const data = await fetchCustomerData();
+      const rawEdges = data.workspace3;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ edges: rawEdges })
+          }
+        ]
+      };
+    } catch (err) {
+      console.error("[MCP APP] Error fetching raw edges:", err.message);
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Error processing request: ${err.message}` }]
+      };
+    }
+  }
 );
 
 server.tool(
   "get_workspace3_formatted",
   "Requests a rendered flow/transition graph diagram for Workspace 3.",
   {},
-  async () =>
-    withAuth(async (accessToken) => {
-      const data = await fetchCustomerData(accessToken);
+  async () => {
+    try {
+      const data = await fetchCustomerData();
       const edges = data.workspace3;
-      const mermaidEdges = edges.map(([from, to]) => `    ${from} --> ${to}`).join("\n");
+
+      const mermaidEdges = edges
+        .map(([from, to]) => `    ${from} --> ${to}`)
+        .join("\n");
 
       return {
         content: [
@@ -287,18 +269,30 @@ server.tool(
           }
         ]
       };
-    })
+    } catch (err) {
+      return { isError: true, content: [{ type: "text", text: err.message }] };
+    }
+  }
 );
 
-// -------------------------------------------------------------------------
-// MCP TRANSPORT
-// No auth gate at connection time: anyone who can reach this URL can
-// connect and list tools. Only tool CALLS that touch customer data require
-// a valid cached session (see withAuth above) — enforced token-side, at
-// mcp-backend and customer-backend, not here.
-// -------------------------------------------------------------------------
-app.use("/mcp", express.json(), async (req, res) => {
+const sendProtectedResourceMetadata = (req, res) => {
+  const host = getHostUrl(req);
+  res.json({
+    resource: `${host}/mcp`,
+    authorization_servers: [CUSTOMER_BACKEND_URL],
+    scopes_supported: ["read", "write"],
+    bearer_methods_supported: ["header"]
+  });
+};
+
+app.get("/.well-known/oauth-protected-resource", sendProtectedResourceMetadata);
+app.get("/.well-known/oauth-protected-resource/mcp", sendProtectedResourceMetadata);
+
+app.use("/mcp", express.json(), validateAuthHeader, async (req, res) => {
   try {
+    const authToken = req.headers.authorization;
+
+    // Create a new transport instance for this HTTP request lifecycle
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined
     });
@@ -307,8 +301,13 @@ app.use("/mcp", express.json(), async (req, res) => {
       transport.close();
     });
 
+    // Connect the single server instance to the new per-request transport
     await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+
+    // Execute request inside AsyncLocalStorage to pass bearer token to tools
+    await requestContext.run({ authToken }, async () => {
+      await transport.handleRequest(req, res, req.body);
+    });
   } catch (err) {
     console.error("[MCP APP] Error during protocol handling:", err);
     if (!res.headersSent) res.status(500).json({ error: "internal_error" });
