@@ -45,14 +45,14 @@ app.use((req, res, next) => {
   next();
 });
 
-const CUSTOMER_BACKEND_URL = process.env.CUSTOMER_BACKEND_URL || "https://customer-backend-stqk.onrender.com";
-const MCP_BACKEND_URL = process.env.MCP_BACKEND_URL || "https://prototype-mcp-backend.onrender.com";
+const CUSTOMER_BACKEND_URL = process.env.CUSTOMER_BACKEND_URL || "https://apikey-customer-backend.onrender.com";
+const MCP_BACKEND_URL = process.env.MCP_BACKEND_URL || "https://apikey-mcp-backend.onrender.com";
 
 const getHostUrl = (req) => `${req.protocol}://${req.get("host")}`;
 
 // resource identifier this app requests tokens against when exchanging an
 // API key. Must match what mcp-backend checks as its expected audience.
-const MCP_APP_RESOURCE_URL = process.env.MCP_APP_RESOURCE_URL || "https://prototype-mcp.onrender.com/mcp";
+const MCP_APP_RESOURCE_URL = process.env.MCP_APP_RESOURCE_URL || "https://apikey-mcp-app.onrender.com/mcp";
 
 // ---------------------------------------------------------------------------
 // SESSION STORE (protocol routing only)
